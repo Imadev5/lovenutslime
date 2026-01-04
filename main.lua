@@ -8,7 +8,7 @@ local LocalPlayer = Players.LocalPlayer
 local library = loadstring(game:HttpGet("https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"))()
 
 local window = library:CreateWindow({
-    Title = "5M Hub | Fixed Shield",
+    Title = "5M Hub",
     SubTitle = "Futbol",
     TabWidth = 140,
     Size = UDim2.fromOffset(700, 400),
@@ -32,15 +32,16 @@ local Config = {
 
 local cachedBalls = {}
 local lastUpdate = 0
+local brokenBalls = {} -- List of balls we have already broken
 
--- // HELPER FUNCTIONS // --
+-- // OPTIMIZATION & FINDER // --
 
 local function updateBalls()
     if tick() - lastUpdate < 1 then return end
     lastUpdate = tick()
     cachedBalls = {}
     for _, v in ipairs(Workspace:GetDescendants()) do
-        if v:IsA("Part") and (v.Name == "TP" or v:FindFirstChild("network")) then
+        if v:IsA("Part") and (v.Name == "TP" or v:FindFirstChild("network") or brokenBalls[v]) then
             table.insert(cachedBalls, v)
         end
     end
@@ -64,21 +65,19 @@ local function getClosestBall()
     return closest
 end
 
--- // THE FIX: GROUND CHECK // --
+-- // PHYSICS HELPERS // --
+
 local function getGroundPosition(rootPos)
     local params = RaycastParams.new()
     params.FilterDescendantsInstances = {LocalPlayer.Character, cachedBalls}
     params.FilterType = Enum.RaycastFilterType.Exclude
-    
-    -- Shoot ray down 10 studs
+    -- Shoot ray down to find floor
     local result = Workspace:Raycast(rootPos, Vector3.new(0, -10, 0), params)
     
     if result then
-        -- Found ground, return position slightly above it
-        return result.Position + Vector3.new(0, 0.8, 0) -- 0.8 is roughly ball radius
+        return result.Position + Vector3.new(0, 0.85, 0) -- Perfect floor height
     else
-        -- In air, return position relative to feet
-        return rootPos - Vector3.new(0, 2.5, 0)
+        return rootPos - Vector3.new(0, 2.5, 0) -- Air fallback
     end
 end
 
@@ -94,10 +93,9 @@ local function findNet(name)
     return nil
 end
 
--- // LOOPS // --
+-- // MAIN LOOPS // --
 
--- 1. Shield Ball (The Fix)
--- Using RenderStepped makes it look smooth, Stepped locks physics
+-- 1. Shield Ball (NETWORK BREAK METHOD)
 RunService.Stepped:Connect(function()
     if not Config.shieldBallOn then return end
     
@@ -105,27 +103,33 @@ RunService.Stepped:Connect(function()
     if not root then return end
     
     local ball = getClosestBall()
-    -- Only grab if close (within 20 studs)
-    if ball and (ball.Position - root.Position).Magnitude < 20 then
+    
+    -- Activation distance
+    if ball and (ball.Position - root.Position).Magnitude < 25 then
         
-        -- Force Ownership
-        if setsimulationradius then setsimulationradius(math.huge, math.huge) end
+        -- A. BREAK THE NETWORK (The logic you asked for)
         local network = ball:FindFirstChild("network")
-        if network then pcall(function() network:SetNetworkOwner(LocalPlayer) end) end
+        if network then
+            -- 1. Force Ownership NOW
+            if setsimulationradius then setsimulationradius(math.huge, math.huge) end
+            pcall(function() network:SetNetworkOwner(LocalPlayer) end)
+            
+            -- 2. DELETE IT (This prevents others from stealing it back)
+            -- We destroy the object that handles ball logic on our client
+            network:Destroy()
+            brokenBalls[ball] = true -- Remember this ball is ours now
+        end
+
+        -- B. FORCE PHYSICS (God Mode Dribble)
+        -- Calculate position in front of player
+        local frontPos = root.CFrame.Position + (root.CFrame.LookVector * 2.5)
+        local groundPos = getGroundPosition(frontPos) -- Use Raycast to prevent under-map
         
-        -- Calculate Position
-        local frontPos = root.CFrame.Position + (root.CFrame.LookVector * 2) -- 2 studs in front
-        local groundPos = getGroundPosition(frontPos)
-        
-        -- HARD LOCK the position
-        ball.CFrame = CFrame.new(groundPos, groundPos + root.CFrame.LookVector)
-        
-        -- Stop it from spinning or drifting
-        ball.AssemblyLinearVelocity = root.AssemblyLinearVelocity -- Match player speed
-        ball.AssemblyAngularVelocity = Vector3.zero
-        
-        -- Prevent collision with YOU (so you don't trip)
+        -- Lock Ball
         ball.CanCollide = false
+        ball.CFrame = CFrame.new(groundPos, groundPos + root.CFrame.LookVector)
+        ball.AssemblyLinearVelocity = root.AssemblyLinearVelocity
+        ball.AssemblyAngularVelocity = Vector3.zero
     end
 end)
 
@@ -134,8 +138,11 @@ RunService.Heartbeat:Connect(function()
     if not Config.reachOn then return end
     local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
     if not root then return end
-    local ball = getClosestBall()
     
+    -- Only reach if we aren't shielding (Shielding already owns the ball)
+    if Config.shieldBallOn then return end
+
+    local ball = getClosestBall()
     if ball and (ball.Position - root.Position).Magnitude < Config.reachDist then
         if firetouchinterest then
             for _, v in ipairs(LocalPlayer.Character:GetChildren()) do
@@ -151,8 +158,11 @@ end)
 -- 3. Magnet
 RunService.Heartbeat:Connect(function()
     if not Config.ballMagnetOn then return end
+    if Config.shieldBallOn then return end -- Don't fight with Shield
+
     local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
     local ball = getClosestBall()
+    
     if root and ball and (ball.Position - root.Position).Magnitude < 25 then
         if setsimulationradius then setsimulationradius(math.huge) end
         local network = ball:FindFirstChild("network")
@@ -173,24 +183,21 @@ UserInputService.InputEnded:Connect(function(input, gp)
             local net = findNet(Config.targetNet)
             if ball and net then
                 local dist = (ball.Position - LocalPlayer.Character.HumanoidRootPart.Position).Magnitude
-                if dist < 15 then
-                    local network = ball:FindFirstChild("network")
-                    if network then pcall(function() network:SetNetworkOwner(LocalPlayer) end) end
-                    
+                if dist < 20 then
+                    -- If network is broken, we still own physics, so we can just shoot
                     local dir = (net.Position - ball.Position).Unit
-                    ball.AssemblyLinearVelocity = dir * Config.shotPower + Vector3.new(0, Config.shotPower/5, 0)
+                    ball.AssemblyLinearVelocity = dir * Config.shotPower + Vector3.new(0, Config.shotPower/6, 0)
                 end
             end
         end
     end
 end)
 
--- 5. Speed & Stamina
+-- 5. Misc (Speed/Stamina)
 RunService.Heartbeat:Connect(function()
     if Config.staminaOn then
         pcall(function() LocalPlayer.PlayerScripts.controllers.movementController.stamina.Value = 100 end)
     end
-    
     if Config.speedBoostOn then
         local char = LocalPlayer.Character
         local hum = char and char:FindFirstChild("Humanoid")
@@ -200,7 +207,7 @@ RunService.Heartbeat:Connect(function()
     end
 end)
 
--- // GUI // --
+-- // UI SETUP // --
 
 local tabs = {
     main = window:AddTab({ Title = "Main", Icon = "home" }),
@@ -208,7 +215,7 @@ local tabs = {
     misc = window:AddTab({ Title = "Misc", Icon = "settings" }),
 }
 
-tabs.game:AddToggle("shield", {Title = "Shield Ball (Fixed)", Default = false, Callback = function(v) Config.shieldBallOn = v end})
+tabs.game:AddToggle("shield", {Title = "Shield Ball (Network Break)", Description = "Deletes network logic so others can't steal.", Default = false, Callback = function(v) Config.shieldBallOn = v end})
 tabs.game:AddToggle("reach", {Title = "Reach", Default = false, Callback = function(v) Config.reachOn = v end})
 tabs.game:AddSlider("reachDist", {Title = "Reach Radius", Default = 10, Min = 1, Max = 50, Callback = function(v) Config.reachDist = v end})
 tabs.game:AddToggle("mag", {Title = "Magnet", Default = false, Callback = function(v) Config.ballMagnetOn = v end})
@@ -233,4 +240,4 @@ LocalPlayer.CharacterAdded:Connect(function(c)
 end)
 
 library:SelectTab(1)
-library:Notify({Title = "Fixed Script Loaded", Content = "Shield Ball will no longer go under map!", Duration = 5})
+library:Notify({Title = "Network Break Loaded", Content = "Shield Ball now destroys network logic!", Duration = 5})
